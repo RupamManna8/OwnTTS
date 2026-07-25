@@ -43,7 +43,7 @@ class Settings(BaseSettings):
         default="./models/voices-v1.0.bin",
         description="Path to the Kokoro voices bundle",
     )
-    DEFAULT_VOICE: str = Field(default="af_heart")
+    DEFAULT_VOICE: str = Field(default="am_adam")
     DEFAULT_SPEED: float = Field(default=1.0)
     DEFAULT_LANG: str = Field(default="en-us")
 
@@ -51,7 +51,7 @@ class Settings(BaseSettings):
     CACHE_ENABLED: bool = Field(default=True)
     CACHE_DIR: str = Field(default="./cache")
     CACHE_SIZE: int = Field(default=256, description="Max cached items (LRU)")
-    CACHE_TTL_SECONDS: int = Field(default=0, description="0 = never expire")
+    CACHE_TTL_SECONDS: int = Field(default=300, description="Keep cache entries for 5 minutes")
 
     # --- Output ---
     OUTPUT_DIR: str = Field(default="./outputs")

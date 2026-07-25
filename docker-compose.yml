@@ -1,0 +1,28 @@
+services:
+  tts-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: kokoro-tts-api
+    ports:
+      - "8000:8000"
+    volumes:
+      # Mount models folder from host to container to avoid bloating the Docker image
+      - ./models:/srv/app/models:ro
+      # Mount cache folder to persist caching across container updates/restarts
+      - ./cache:/srv/app/cache
+      # Mount outputs folder to make generated audio files easily accessible on the host
+      - ./outputs:/srv/app/outputs
+      # Mount logs folder for logging/observability
+      - ./logs:/srv/app/logs
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - PYTHONUNBUFFERED=1
+      - PYTHONDONTWRITEBYTECODE=1
+      - CACHE_DIR=/srv/app/cache
+      - OUTPUT_DIR=/srv/app/outputs
+      - LOG_DIR=/srv/app/logs
+      - MODEL_PATH=/srv/app/models/kokoro-v1.0.onnx
+      - VOICES_PATH=/srv/app/models/voices-v1.0.bin

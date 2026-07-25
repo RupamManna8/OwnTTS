@@ -116,9 +116,69 @@ class KokoroTTSService(BaseTTSService):
                 # Imported lazily so the rest of the app can be imported/tested
                 # without the (relatively heavy) onnxruntime dependency present.
                 from kokoro_onnx import Kokoro
+                import onnxruntime as rt
 
+                # Configure ONNX Runtime SessionOptions for CPU
+                opts = rt.SessionOptions()
+                # Explicitly enable CPU memory arena and memory pattern (critical for performance)
+                opts.enable_cpu_mem_arena = True
+                opts.enable_mem_pattern = True
+                opts.graph_optimization_level = rt.GraphOptimizationLevel.ORT_ENABLE_ALL
+                opts.execution_mode = rt.ExecutionMode.ORT_SEQUENTIAL
+                
+                # Do NOT set intra_op_num_threads or inter_op_num_threads to allow OpenMP dynamic scheduling.
+
+                sess = rt.InferenceSession(str(model_path), sess_options=opts, providers=["CPUExecutionProvider"])
+
+                # 1. Apply Tokenizer.phonemize LRU cache monkeypatch
+                from functools import lru_cache
+                from kokoro_onnx.tokenizer import Tokenizer
+                
+                original_phonemize = Tokenizer.phonemize
+                
+                @lru_cache(maxsize=1024)
+                def cached_phonemize(self_tok, text, lang="en-us", norm=True):
+                    return original_phonemize(self_tok, text, lang, norm)
+                    
+                Tokenizer.phonemize = cached_phonemize
+
+                # 2. Apply Kokoro._create_audio copy reduction monkeypatch
+                from kokoro_onnx.config import MAX_PHONEME_LENGTH, SAMPLE_RATE
+                
+                def optimized_create_audio(self_kokoro, phonemes: str, voice: np.ndarray, speed: float) -> tuple[np.ndarray, int]:
+                    phonemes = phonemes[:MAX_PHONEME_LENGTH]
+                    
+                    tokens_list = self_kokoro.tokenizer.tokenize(phonemes)
+                    token_count = len(tokens_list)
+                    
+                    # Direct NumPy array construction (avoids Python lists/lists within wrapper)
+                    tokens_arr = np.zeros((1, token_count + 2), dtype=np.int64)
+                    tokens_arr[0, 1:-1] = tokens_list
+                    
+                    part_voice = voice[token_count]
+                    
+                    input_names = [i.name for i in self_kokoro.sess.get_inputs()]
+                    if "input_ids" in input_names:
+                        inputs = {
+                            "input_ids": tokens_arr,
+                            "style": part_voice,
+                            "speed": np.array([speed], dtype=np.int32),
+                        }
+                    else:
+                        inputs = {
+                            "tokens": tokens_arr,
+                            "style": part_voice,
+                            "speed": np.array([speed], dtype=np.float32),
+                        }
+                        
+                    audio = self_kokoro.sess.run(None, inputs)[0]
+                    return audio, SAMPLE_RATE
+                    
+                Kokoro._create_audio = optimized_create_audio
+
+                # Create the Kokoro instance from session
                 self._model = await asyncio.to_thread(
-                    Kokoro, str(model_path), str(voices_path)
+                    Kokoro.from_session, sess, str(voices_path)
                 )
             except ImportError as exc:
                 raise ModelLoadError(

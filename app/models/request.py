@@ -10,7 +10,7 @@ class SpeechRequest(BaseModel):
     """Payload for POST /v1/audio/speech."""
 
     text: str = Field(..., description="Text to synthesize", min_length=1)
-    voice: str = Field(default="af_heart", description="Voice identifier")
+    voice: str = Field(default="am_adam", description="Voice identifier")
     speed: float = Field(default=1.0, ge=0.25, le=4.0, description="Playback speed multiplier")
     format: AudioFormat = Field(default="wav", description="Output audio format")
     lang: Optional[str] = Field(default=None, description="Override language code")

@@ -40,10 +40,28 @@ class AudioCache:
         if self._index_path.exists():
             try:
                 raw = json.loads(self._index_path.read_text(encoding="utf-8"))
+                ttl = self._settings.CACHE_TTL_SECONDS
+                now = time.time()
+                valid_entries = {}
+                expired_count = 0
+                for k, v in raw.items():
+                    created_at = v.get("created_at", 0)
+                    fmt = v.get("format", "wav")
+                    if ttl > 0 and (now - created_at) > ttl:
+                        self._file_path(k, fmt).unlink(missing_ok=True)
+                        expired_count += 1
+                    else:
+                        valid_entries[k] = v
+
+                if expired_count > 0:
+                    logger.info("Evicted %d expired cache entries during startup", expired_count)
+
                 # Preserve insertion/recency order as stored.
                 self._index = OrderedDict(
-                    (k, v) for k, v in sorted(raw.items(), key=lambda kv: kv[1].get("last_used", 0))
+                    (k, v) for k, v in sorted(valid_entries.items(), key=lambda kv: kv[1].get("last_used", 0))
                 )
+                if expired_count > 0:
+                    self._persist_index()
             except (json.JSONDecodeError, OSError) as exc:
                 logger.warning("Failed to load cache index, starting fresh: %s", exc)
                 self._index = OrderedDict()
@@ -54,7 +72,12 @@ class AudioCache:
     def _persist_index(self) -> None:
         start_time = time.perf_counter()
         try:
-            self._index_path.write_text(json.dumps(self._index), encoding="utf-8")
+            # Strip out "data" field (raw bytes cache) before serializing index
+            serializable_index = {
+                k: {ki: vi for ki, vi in v.items() if ki != "data"}
+                for k, v in self._index.items()
+            }
+            self._index_path.write_text(json.dumps(serializable_index), encoding="utf-8")
         except OSError as exc:
             raise CacheError(f"Failed to persist cache index: {exc}") from exc
         if self._settings.PROFILE_ENABLED:
@@ -78,17 +101,27 @@ class AudioCache:
                     self._misses += 1
                     return None
 
+                # Check TTL expiration (both memory/disk entries)
+                ttl = self._settings.CACHE_TTL_SECONDS
+                if ttl > 0 and (time.time() - entry.get("created_at", 0)) > ttl:
+                    self._index.pop(key, None)
+                    self._file_path(key, fmt).unlink(missing_ok=True)
+                    self._misses += 1
+                    return None
+
+                # Return memory-cached bytes instantly (L1 hit)
+                if "data" in entry:
+                    self._index.move_to_end(key)
+                    entry["last_used"] = time.time()
+                    self._hits += 1
+                    hit = True
+                    data = entry["data"]
+                    return data
+
                 path = self._file_path(key, fmt)
                 if not path.exists():
                     # Index/disk drifted apart; self-heal.
                     self._index.pop(key, None)
-                    self._misses += 1
-                    return None
-
-                ttl = self._settings.CACHE_TTL_SECONDS
-                if ttl > 0 and (time.time() - entry.get("created_at", 0)) > ttl:
-                    self._index.pop(key, None)
-                    path.unlink(missing_ok=True)
                     self._misses += 1
                     return None
 
@@ -98,6 +131,10 @@ class AudioCache:
                 hit = True
 
             data = path.read_bytes()
+            # Store in in-memory cache for subsequent hits
+            async with self._lock:
+                if key in self._index:
+                    self._index[key]["data"] = data
             return data
         except OSError as exc:
             raise CacheError(f"Failed to read cached audio: {exc}") from exc
@@ -126,7 +163,27 @@ class AudioCache:
 
             async with self._lock:
                 now = time.time()
-                self._index[key] = {"format": fmt, "created_at": now, "last_used": now, "size": len(data)}
+                
+                # Proactively evict any expired items from the cache index
+                ttl = self._settings.CACHE_TTL_SECONDS
+                if ttl > 0:
+                    expired_keys = [
+                        k for k, v in self._index.items()
+                        if (now - v.get("created_at", 0)) > ttl
+                    ]
+                    for k in expired_keys:
+                        entry = self._index.pop(k, None)
+                        if entry:
+                            self._file_path(k, entry.get("format", "wav")).unlink(missing_ok=True)
+                            logger.debug("Evicted expired cache entry %s", k)
+
+                self._index[key] = {
+                    "format": fmt,
+                    "created_at": now,
+                    "last_used": now,
+                    "size": len(data),
+                    "data": data  # Cache the bytes in memory!
+                }
                 self._index.move_to_end(key)
                 await self._evict_if_needed()
                 self._persist_index()
