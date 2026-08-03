@@ -36,11 +36,11 @@ class Settings(BaseSettings):
 
     # --- Model ---
     MODEL_PATH: str = Field(
-        default="./models/kokoro-v1.0.onnx",
+        default=r"D:\OwnTTs\models\kokoro-v1.0.onnx",
         description="Path to the Kokoro ONNX model file",
     )
     VOICES_PATH: str = Field(
-        default="./models/voices-v1.0.bin",
+        default=r"D:\OwnTTs\models\voices-v1.0.bin",
         description="Path to the Kokoro voices bundle",
     )
     DEFAULT_VOICE: str = Field(default="am_adam")

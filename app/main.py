@@ -1,4 +1,10 @@
+import sys
 import time
+from pathlib import Path
+
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 APP_IMPORT_START_TIME = time.perf_counter()
 
 from contextlib import asynccontextmanager

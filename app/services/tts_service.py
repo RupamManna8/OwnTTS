@@ -17,6 +17,8 @@ in a worker thread via `asyncio.to_thread` to avoid blocking the event
 loop and to let FastAPI serve many requests concurrently.
 """
 import asyncio
+import os
+import re
 import time
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -30,6 +32,9 @@ from app.core.logger import get_logger
 from app.services.voice_manager import VoiceManager
 
 logger = get_logger("tts_service")
+
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+_MAX_CHUNK_CHARS = 240
 
 
 class BaseTTSService(ABC):
@@ -76,6 +81,54 @@ class KokoroTTSService(BaseTTSService):
 
     def voice_load_duration_seconds(self) -> Optional[float]:
         return self._voice_load_duration
+
+    @staticmethod
+    def _split_text_into_chunks(text: str) -> List[str]:
+        """Split text into sentence-sized chunks for parallel synthesis."""
+        normalized = " ".join(text.split())
+        if not normalized:
+            return []
+
+        sentence_chunks = [chunk.strip() for chunk in _SENTENCE_SPLIT_RE.split(normalized) if chunk.strip()]
+        if not sentence_chunks:
+            sentence_chunks = [normalized]
+
+        chunks: List[str] = []
+        for sentence in sentence_chunks:
+            if len(sentence) <= _MAX_CHUNK_CHARS:
+                chunks.append(sentence)
+                continue
+
+            words = sentence.split()
+            current_words: List[str] = []
+            current_length = 0
+            for word in words:
+                extra = len(word) if not current_words else len(word) + 1
+                if current_words and current_length + extra > _MAX_CHUNK_CHARS:
+                    chunks.append(" ".join(current_words))
+                    current_words = [word]
+                    current_length = len(word)
+                else:
+                    current_words.append(word)
+                    current_length += extra
+
+            if current_words:
+                chunks.append(" ".join(current_words))
+
+        return chunks
+
+    async def _synthesize_chunk(self, text: str, voice: str, speed: float, lang: Optional[str]) -> Tuple[np.ndarray, int]:
+        if not self._ready or self._model is None:
+            raise ModelNotLoadedError("Model is still loading. Please retry shortly.")
+
+        effective_lang = lang or self._settings.DEFAULT_LANG
+        return await asyncio.to_thread(
+            self._model.create,
+            text,
+            voice=voice,
+            speed=speed,
+            lang=effective_lang,
+        )
 
     @classmethod
     async def get_instance(cls, settings: Optional[Settings] = None) -> "KokoroTTSService":
@@ -232,16 +285,33 @@ class KokoroTTSService(BaseTTSService):
         if not self._ready or self._model is None:
             raise ModelNotLoadedError("Model is still loading. Please retry shortly.")
 
-        effective_lang = lang or self._settings.DEFAULT_LANG
         create_start = time.perf_counter()
         try:
-            samples, sample_rate = await asyncio.to_thread(
-                self._model.create,
-                text,
-                voice=voice,
-                speed=speed,
-                lang=effective_lang,
-            )
+            chunks = self._split_text_into_chunks(text)
+            if not chunks:
+                raise SynthesisError("Synthesis received empty text after normalization.")
+
+            if len(chunks) == 1:
+                samples, sample_rate = await self._synthesize_chunk(chunks[0], voice, speed, lang)
+            else:
+                max_workers = min(len(chunks), max(1, os.cpu_count() or 1))
+                semaphore = asyncio.Semaphore(max_workers)
+
+                async def synthesize_with_limit(chunk: str) -> Tuple[np.ndarray, int]:
+                    async with semaphore:
+                        return await self._synthesize_chunk(chunk, voice, speed, lang)
+
+                chunk_results = await asyncio.gather(*(synthesize_with_limit(chunk) for chunk in chunks))
+
+                sample_rate = int(chunk_results[0][1])
+                merged_samples: List[np.ndarray] = []
+                for chunk_samples, chunk_sample_rate in chunk_results:
+                    if int(chunk_sample_rate) != sample_rate:
+                        raise SynthesisError("Parallel synthesis returned mismatched sample rates.")
+                    merged_samples.append(np.asarray(chunk_samples, dtype=np.float32))
+
+                samples = np.concatenate(merged_samples) if len(merged_samples) > 1 else merged_samples[0]
+
             create_ms = (time.perf_counter() - create_start) * 1000
             total_synth_ms = (time.perf_counter() - total_start) * 1000
 
